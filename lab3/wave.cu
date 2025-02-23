@@ -149,8 +149,8 @@ __global__ void wave_gpu_naive_step(
                     (u1[idx - 1] + u1[idx + 1] + u1[idx - n_cells_x] +
                     u1[idx + n_cells_x]));
     }
-    u0[idx] = u_next_val;
 
+    u0[idx] = u_next_val;
 
 }
 
@@ -171,6 +171,7 @@ __global__ void wave_gpu_naive_step(
 //     the wave u(t0 + (n_steps - 1) * dt) and u(t0 + n_steps * dt) after all
 //     launched kernels have completed.
 //
+
 template <typename Scene>
 std::pair<float *, float *> wave_gpu_naive(
     float t0,
@@ -178,13 +179,14 @@ std::pair<float *, float *> wave_gpu_naive(
     float *u0, /* pointer to GPU memory */
     float *u1  /* pointer to GPU memory */
 ) {
-    dim3 block_size = dim3(32, 16);
+    dim3 block_size = dim3(16, 16);
     dim3 num_blocks = dim3(ceil_div(Scene::n_cells_x, block_size.x), 
                             ceil_div(Scene::n_cells_y, block_size.y));
 
     for (int32_t idx_step = 0; idx_step < n_steps; idx_step++) {
         float t = t0 + idx_step * Scene::dt;
         wave_gpu_naive_step<Scene><<<num_blocks, block_size>>>(t, u0, u1);
+        cudaDeviceSynchronize();
         std::swap(u0, u1);
     }
     return {u0, u1};
@@ -193,60 +195,110 @@ std::pair<float *, float *> wave_gpu_naive(
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Shared Memory)
 
+
+__device__ __forceinline__ void swap(float* &a, float* &b) {
+    float* temp = a;
+    a = b;
+    b = temp;
+}
+
+#define COARSENING_FACTOR 4
+constexpr uint32_t n_steps_per_kernel = 5;
+
+
 template <typename Scene>
 __global__ void wave_gpu_shmem_multistep(
     float t,
     uint32_t n_steps,
     float *u0,      /* pointer to GPU memory */
-    float const *u1 /* pointer to GPU memory */
+    float *u1, /* pointer to GPU memory */
+    float *extra0,
+    float *extra1
 ) {
     constexpr int32_t n_cells_x = Scene::n_cells_x;
     constexpr int32_t n_cells_y = Scene::n_cells_y;
     constexpr float c = Scene::c;
     constexpr float dx = Scene::dx;
     constexpr float dt = Scene::dt;
+    uint32_t tileDim_x = blockDim.x * COARSENING_FACTOR;
+    uint32_t tileDim_y = blockDim.y;
 
     extern __shared__ float my_shared_memory[];
     float* u1_block = my_shared_memory;
-    int32_t l_idx = threadIdx.y*blockDim.x + threadIdx.x; // local index for thread block
+    float* u0_block = my_shared_memory + (tileDim_x * tileDim_y);
 
-    int32_t idx_x = (blockDim.x - 2 * n_steps) * blockIdx.x + threadIdx.x - n_steps;
-    int32_t idx_y = (blockDim.y - 2 * n_steps) * blockIdx.y + threadIdx.y - n_steps;
-    int32_t idx = idx_y * n_cells_x + idx_x;
+    
+    // store u1 and u0 into shared memory
+    #pragma unroll
+    for (uint32_t i = 0; i < COARSENING_FACTOR; i++) {
+        int32_t tileIdx_x = threadIdx.x + i*(blockDim.x);
+        int32_t tileIdx_y = threadIdx.y;
+        int32_t l_idx = tileIdx_y*tileDim_x + tileIdx_x;
 
-    // disable out of bounds, set to 0
-    if (idx_x < 0 || idx_y < 0 || idx_x >= n_cells_x || idx_y >= n_cells_y) {
-        return;
+        int32_t idx_x = (tileDim_x - 2 * n_steps) * blockIdx.x + tileIdx_x - n_steps;
+        int32_t idx_y = (tileDim_y - 2 * n_steps) * blockIdx.y + tileIdx_y - n_steps;
+        int32_t idx = idx_y * n_cells_x + idx_x;
+
+        bool in_bounds = (idx_x >= 0) && (idx_y >= 0) && (idx_x < n_cells_x) && (idx_y < n_cells_y);
+
+        if (in_bounds) {
+            u1_block[l_idx] = u1[idx];
+            u0_block[l_idx] = u0[idx];
+        } else {
+            u1_block[l_idx] = 0;
+            u0_block[l_idx] = 0;
+        }
     }
-
-    u1_block[l_idx] = u1[idx];
     __syncthreads();
 
-    // disable invalid data on the border;
-    if ((threadIdx.x < n_steps) || 
-        (threadIdx.y < n_steps) || 
-        ((blockDim.x - 1 - threadIdx.x) < n_steps) || 
-        ((blockDim.y - 1 - threadIdx.y) < n_steps)) {
-        return;
-    }
+    for (int r = 1; r <= n_steps; r++) {
+        for (uint32_t i = 0; i < COARSENING_FACTOR; i++) {
+            int32_t tileIdx_x = threadIdx.x + i*(blockDim.x);
+            int32_t tileIdx_y = threadIdx.y;
+            int32_t l_idx = tileIdx_y*tileDim_x + tileIdx_x;
 
-    bool is_border = (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||idx_y == n_cells_y - 1);
-    float u_next_val;
-    if (is_border || Scene::is_wall(idx_x, idx_y)) {
-        u_next_val = 0.0f;
-    } else if (Scene::is_source(idx_x, idx_y)) {
-        u_next_val = Scene::source_value(idx_x, idx_y, t);
-    } else {
-        constexpr float coeff = c * c * dt * dt / (dx * dx);
-        float damping = Scene::damping(idx_x, idx_y);
-        u_next_val =
-            ((2.0f - damping - 4.0f * coeff) * u1_block[l_idx] -
-                (1.0f - damping) * u0[idx] +
-                coeff *
-                    (u1_block[l_idx - 1] + u1_block[l_idx + 1] + u1_block[l_idx - blockDim.x] +
-                    u1_block[l_idx + blockDim.x]));
+            int32_t idx_x = (tileDim_x - 2 * n_steps) * blockIdx.x + tileIdx_x - n_steps;
+            int32_t idx_y = (tileDim_y - 2 * n_steps) * blockIdx.y + tileIdx_y - n_steps;
+            int32_t idx = idx_y * n_cells_x + idx_x;
+
+            bool in_bounds = (idx_x >= 0) && (idx_y >= 0) && (idx_x < n_cells_x) && (idx_y < n_cells_y);
+
+            bool is_valid = (tileIdx_x >= r) && 
+                            (tileIdx_y >= r) && 
+                            (tileIdx_x < (tileDim_x - r)) &&
+                            (tileIdx_y < (tileDim_y - r));
+
+            bool is_border = (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||idx_y == n_cells_y - 1);
+            float u_next_val;
+            if (in_bounds && is_valid) {
+                if (is_border || Scene::is_wall(idx_x, idx_y)) {
+                    u_next_val = 0.0f;
+                } else if (Scene::is_source(idx_x, idx_y)) {
+                    u_next_val = Scene::source_value(idx_x, idx_y, t);
+                } else {
+                    constexpr float coeff = c * c * dt * dt / (dx * dx);
+                    float damping = Scene::damping(idx_x, idx_y);
+                    u_next_val =
+                        ((2.0f - damping - 4.0f * coeff) * u1_block[l_idx] -
+                            (1.0f - damping) * u0_block[l_idx] +
+                            coeff *
+                                (u1_block[l_idx - 1] + u1_block[l_idx + 1] + u1_block[l_idx - tileDim_x] +
+                                u1_block[l_idx + tileDim_x]));
+                }
+            }
+            
+            if (in_bounds && is_valid) {
+                if (r != n_steps) {
+                    u0_block[l_idx] = u_next_val;
+                } else {
+                    extra0[idx] = u_next_val;
+                    extra1[idx] = u1_block[l_idx];
+                }
+            }
+        }
+        swap(u0_block, u1_block);
+        t += Scene::dt;
     }
-    u0[idx] = u_next_val;
 }
 
 // 'wave_gpu_shmem':
@@ -275,7 +327,6 @@ __global__ void wave_gpu_shmem_multistep(
 //
 
 
-
 template <typename Scene>
 std::pair<float *, float *> wave_gpu_shmem(
     float t0,
@@ -285,27 +336,31 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra0, /* pointer to GPU memory */
     float *extra1  /* pointer to GPU memory */
 ) {
-    dim3 block_size = dim3(32, 16);
-    dim3 tile_size = dim3(block_size.x - 2*1, block_size.y - 2*1);
+    dim3 block_size = dim3(32, 32);
+    dim3 tile_size = dim3(COARSENING_FACTOR * block_size.x - 2 * n_steps_per_kernel, 
+                          block_size.y - 2*n_steps_per_kernel);
     dim3 num_blocks = dim3(ceil_div(Scene::n_cells_x, tile_size.x), 
                             ceil_div(Scene::n_cells_y, tile_size.y));
-    uint32_t shmem_size_bytes = block_size.x * block_size.y * sizeof(float);
 
+    // allocate shared memory block of block_size.x * block_size.y for two buffers (u0, u1)
+    uint32_t shmem_size_bytes = COARSENING_FACTOR * 2 * block_size.x * block_size.y * sizeof(float);
     CUDA_CHECK(cudaFuncSetAttribute(
         wave_gpu_shmem_multistep<Scene>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, 
         shmem_size_bytes));
     
-    for (int32_t idx_step = 0; idx_step < n_steps; idx_step++) {
+    for (int32_t idx_step = 0; idx_step < n_steps; idx_step += n_steps_per_kernel) {
+        int current_steps = std::min(n_steps - idx_step, (int)n_steps_per_kernel);
         float t = t0 + idx_step * Scene::dt;
-        wave_gpu_shmem_multistep<Scene><<<num_blocks, block_size, shmem_size_bytes>>>(t, 1, u0, u1);
+        wave_gpu_shmem_multistep<Scene><<<num_blocks, block_size, shmem_size_bytes>>>(t, current_steps, u0, u1, extra0, extra1);
+        CUDA_CHECK(cudaGetLastError());
+
+        std::swap(u0, extra0);
+        std::swap(u1, extra1);
         std::swap(u0, u1);
     }
-
-    // /* TODO: your CPU code here... */
     return {u0, u1};
 }
-
 /// <--- /your code here --->
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -838,7 +893,7 @@ int generate_animation(const FFmpegFrames &frames, std::string fname) {
     return 0;
 }
 
-// Compile command: nvcc -O3 --use_fast_math -o wave wave.cu
+// nvcc -O3 --use_fast_math -o wave wave.cu
 int main(int argc, char **argv) {
     // Small scale tests: mainly for correctness.
     double tolerance = 3e-2;
