@@ -176,8 +176,8 @@ void launch_matmul_l1_reg(
 
 namespace matmul_improved {
 
-#define K 2 
-// #define M 2 
+#define K2 3 
+#define R 2
 
 __global__ void matmul_improved(
     int32_t size_i,
@@ -187,12 +187,9 @@ __global__ void matmul_improved(
     float const *b, /* pointer to GPU memory */
     float *c /* pointer to GPU memory */) {
     
-    dim3 tileDim{K * blockDim.x, K * blockDim.y};
+    const dim3 tileDim{K2 * blockDim.x, K2 * blockDim.y};
     uint32_t i = tileDim.y * blockIdx.y + threadIdx.y;
     uint32_t j = tileDim.x * blockIdx.x + threadIdx.x;
-
-    uint32_t _i = K * (blockDim.y * blockIdx.y + threadIdx.y);
-    uint32_t _j = K * (blockDim.x * blockIdx.x + threadIdx.x);
 
     extern __shared__ float shmem[];
     float* a_shared = shmem;
@@ -200,18 +197,18 @@ __global__ void matmul_improved(
     
     // if (i >= size_i || j >= size_j) return;
 
-    float a_microtile[K][K] = {0};
-    float b_microtile[K][K] = {0};
+    float a_microtile[K2] = {0};
+    float b_microtile[K2] = {0};
     
-    float sum[K][K] = {0};
+    float sum[K2][K2] = {0};
 
     uint32_t tile_iters = (size_k + tileDim.x - 1) / tileDim.x;
     for (int tile_idx = 0; tile_idx < tile_iters; tile_idx++) {
         // load into shared memory
         #pragma unroll
-        for (int y = 0; y < K; y++) {
+        for (int y = 0; y < K2; y++) {
             #pragma unroll
-            for (int x = 0; x < K; x++) {
+            for (int x = 0; x < K2; x++) {
                 uint32_t ty = threadIdx.y + y*blockDim.y;
                 uint32_t tx = threadIdx.x + x*blockDim.x;
 
@@ -220,26 +217,21 @@ __global__ void matmul_improved(
             }
         }
         __syncthreads();
-        for (int microtile_idx = 0; microtile_idx < tileDim.x/K; microtile_idx++) {
+
+        for (int k = 0; k < tileDim.y; k++) {
             // load into microtile
             #pragma unroll
-            for (int y = 0; y < K; y++) {
-                #pragma unroll
-                for (int x = 0; x < K; x++) {
-                    a_microtile[y][x] = a_shared[(K*threadIdx.y+y)*tileDim.x + (microtile_idx*K + x)];
-                    b_microtile[y][x] = b_shared[(microtile_idx * K + y)*tileDim.x + (K*threadIdx.x+x)];
-                }
+            for (int i = 0; i < K2; i++) {
+                a_microtile[i] = a_shared[(i*blockDim.y + threadIdx.y)*tileDim.x + (k)];
+                b_microtile[i] = b_shared[(k)*tileDim.x + (threadIdx.x + i*blockDim.x)];
             }
 
             // compute microtile
             #pragma unroll
-            for (int y = 0; y < K; y++) {
+            for (int y = 0; y < K2; y++) {
                 #pragma unroll
-                for (int x = 0; x < K; x++) {
-                    #pragma unroll
-                    for (int k = 0; k < K; k++) {
-                        sum[y][x] += a_microtile[y][k] * b_microtile[k][x];
-                    }
+                for (int x = 0; x < K2; x++) {
+                    sum[y][x] += a_microtile[y] * b_microtile[x];
                 }
             }
         }
@@ -247,10 +239,10 @@ __global__ void matmul_improved(
     }
     // store microtile sums
     #pragma unroll
-    for (int y = 0; y < K; y++) {
+    for (int y = 0; y < K2; y++) {
         #pragma unroll
-        for (int x = 0; x < K; x++) {
-            c[(_i+y)*size_j + (_j+x)] = sum[y][x];
+        for (int x = 0; x < K2; x++) {
+            c[(i + y*blockDim.y)*size_j + (j + x*blockDim.x)] = sum[y][x];
         }
     }
 }
@@ -264,7 +256,7 @@ void launch_matmul_improved(
     float *c /* pointer to GPU memory */) {
     
     dim3 block_size(32, 32);
-    dim3 tile_size(K * block_size.x, K * block_size.y); // does block_size * k work?
+    dim3 tile_size(K2 * block_size.x, K2 * block_size.y); // does block_size * k work?
     dim3 num_blocks((size_j + tile_size.x - 1) / tile_size.x,
                     (size_i + tile_size.y - 1) / tile_size.y);
     
