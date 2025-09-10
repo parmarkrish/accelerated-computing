@@ -94,8 +94,8 @@ __global__ void matmul_l1_reg(
     
     if (i >= size_i || j >= size_j) return;
 
-    float a_microtile[K][K] = {0};
-    float b_microtile[K][K] = {0};
+    float a_microtile[K] = {0};
+    float b_microtile[K] = {0};
     
     float sum[K][K] = {0};
 
@@ -111,15 +111,13 @@ __global__ void matmul_l1_reg(
             }
         }
         __syncthreads();
-        for (int microtile_idx = 0; microtile_idx < tileDim.x/K; microtile_idx++) {
+        for (int microtile_idx = 0; microtile_idx < tileDim.x; microtile_idx++) {
             // load into microtile
             #pragma unroll
             for (int y = 0; y < K; y++) {
-                #pragma unroll
-                for (int x = 0; x < K; x++) {
-                    a_microtile[y][x] = a_shared[(t.y+y)*tileDim.x + (microtile_idx*K + x)];
-                    b_microtile[y][x] = b_shared[(microtile_idx * K + y)*tileDim.x + (t.x+x)];
-                }
+                // #pragma unroll
+                a_microtile[y] = a_shared[(t.y+y)*tileDim.x + (microtile_idx)];
+                b_microtile[y] = b_shared[(microtile_idx)*tileDim.x + (t.x+y)];
             }
 
             // compute microtile
@@ -127,10 +125,7 @@ __global__ void matmul_l1_reg(
             for (int y = 0; y < K; y++) {
                 #pragma unroll
                 for (int x = 0; x < K; x++) {
-                    #pragma unroll
-                    for (int k = 0; k < K; k++) {
-                        sum[y][x] += a_microtile[y][k] * b_microtile[k][x];
-                    }
+                    sum[y][x] += a_microtile[y] * b_microtile[x];
                 }
             }
         }
@@ -176,8 +171,8 @@ void launch_matmul_l1_reg(
 
 namespace matmul_improved {
 
-#define K2 3 
-#define R 2
+#define K2 2 
+#define R 1
 
 __global__ void matmul_improved(
     int32_t size_i,
@@ -197,8 +192,8 @@ __global__ void matmul_improved(
     
     // if (i >= size_i || j >= size_j) return;
 
-    float a_microtile[K2] = {0};
-    float b_microtile[K2] = {0};
+    float a_microtile[K2][R] = {0};
+    float b_microtile[R][K2] = {0};
     
     float sum[K2][K2] = {0};
 
@@ -218,20 +213,28 @@ __global__ void matmul_improved(
         }
         __syncthreads();
 
-        for (int k = 0; k < tileDim.y; k++) {
+        for (int k = 0; k < tileDim.x; k += R) {
+            // if (i == 0 && j == 0) {
+            //     printf("%d\n", k);
+            // }
             // load into microtile
             #pragma unroll
-            for (int i = 0; i < K2; i++) {
-                a_microtile[i] = a_shared[(i*blockDim.y + threadIdx.y)*tileDim.x + (k)];
-                b_microtile[i] = b_shared[(k)*tileDim.x + (threadIdx.x + i*blockDim.x)];
+            for (int x = 0; x < K2; x++) {
+                #pragma unroll
+                for (int r = 0; r < R; r++) {
+                    a_microtile[x][r] = a_shared[(x*blockDim.y + threadIdx.y)*tileDim.x + (k+r)];
+                    b_microtile[r][x] = b_shared[(k+r)*tileDim.x + (threadIdx.x + x*blockDim.x)];
+                }
             }
-
             // compute microtile
             #pragma unroll
             for (int y = 0; y < K2; y++) {
                 #pragma unroll
                 for (int x = 0; x < K2; x++) {
-                    sum[y][x] += a_microtile[y] * b_microtile[x];
+                    #pragma unroll
+                    for (int r = 0; r < R; r++) {
+                        sum[y][x] += a_microtile[y][r] * b_microtile[r][x];
+                    }
                 }
             }
         }
