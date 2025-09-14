@@ -24,7 +24,7 @@ void cuda_check(cudaError_t code, const char *file, int line) {
         cuda_check((x), __FILE__, __LINE__); \
     } while (0)
 
-__device__ inline void cp_async4(void *smem_ptr, const void *glob_ptr) {
+__device__ inline void cp_async4(const void *smem_ptr, const void *glob_ptr) {
     const int BYTES = 16;
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile(
@@ -90,7 +90,7 @@ __global__ void matmul_l1_reg(
 
     extern __shared__ float shmem[];
     float* a_shared = shmem;
-    float* b_shared = &shmem[tileDim.x * tileDim.y];
+    float* b_shared = &shmem[2 * tileDim.x * tileDim.y];
     
     if (i >= size_i || j >= size_j) return;
 
@@ -100,23 +100,26 @@ __global__ void matmul_l1_reg(
     float sum[K][K] = {0};
 
     uint32_t tile_iters = (size_k + tileDim.x - 1) / tileDim.x;
-    for (int tile_idx = 0; tile_idx < tile_iters; tile_idx++) {
+
+    for (int tile_idx = 0; tile_idx < tile_iters; tile_idx += 2) {
         // load into shared memory
         #pragma unroll
         for (int y = 0; y < K; y++) {
             #pragma unroll
             for (int x = 0; x < K; x++) {
-                a_shared[(t.y+y)*tileDim.x + (t.x+x)] = a[(i+y)*size_k + (tile_idx*tileDim.x + t.x+x)];
+                a_shared[(t.y+y)*(2*tileDim.x) + (t.x+x)] = a[(i+y)*size_k + (tile_idx*tileDim.x + t.x+x)];
+                a_shared[(t.y+y)*(2*tileDim.x) + (t.x+x + tileDim.x)] = a[(i+y)*size_k + ((tile_idx+1)*tileDim.x + t.x+x)];
+
                 b_shared[(t.y+y)*tileDim.x + (t.x+x)] = b[(tile_idx * tileDim.y + t.y+y)*size_j + (j+x)];
+                b_shared[(t.y+y + tileDim.y)*tileDim.x + (t.x+x)] = b[((tile_idx+1) * tileDim.y + t.y+y)*size_j + (j+x)];
             }
         }
         __syncthreads();
-        for (int microtile_idx = 0; microtile_idx < tileDim.x; microtile_idx++) {
+        for (int microtile_idx = 0; microtile_idx < tileDim.x*2; microtile_idx++) {
             // load into microtile
             #pragma unroll
             for (int y = 0; y < K; y++) {
-                // #pragma unroll
-                a_microtile[y] = a_shared[(t.y+y)*tileDim.x + (microtile_idx)];
+                a_microtile[y] = a_shared[(t.y+y)*(2*tileDim.x) + (microtile_idx)];
                 b_microtile[y] = b_shared[(microtile_idx)*tileDim.x + (t.x+y)];
             }
 
@@ -131,6 +134,7 @@ __global__ void matmul_l1_reg(
         }
         __syncthreads();
     }
+
     // store microtile sums
     #pragma unroll
     for (int y = 0; y < K; y++) {
@@ -154,7 +158,7 @@ void launch_matmul_l1_reg(
     dim3 num_blocks((size_j + tile_size.x - 1) / tile_size.x,
                     (size_i + tile_size.y - 1) / tile_size.y);
     
-    uint32_t shmem_bytes = 2 * tile_size.x * tile_size.y * sizeof(float);
+    uint32_t shmem_bytes = 2 * 2 * tile_size.x * tile_size.y * sizeof(float);
 
     CUDA_CHECK(cudaFuncSetAttribute(
         matmul_l1_reg,
@@ -169,10 +173,118 @@ void launch_matmul_l1_reg(
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
+__device__ __forceinline__ void swap(float* &a, float* &b) {
+    float* temp = a;
+    a = b;
+    b = temp;
+}
+
 namespace matmul_improved {
 
-#define K2 2 
-#define R 1
+
+constexpr int MICROTILE_SIZE = 4;
+constexpr int REDUCE_DIM = 32;
+constexpr int MICROTILE_REDUCE_DIM = 4;
+
+__device__ __forceinline__ void load_tiles_to_shared_fp4(
+    float* a_shared, 
+    float* b_shared, 
+    const float* a, 
+    const float* b, 
+    int size_i,
+    int size_j,
+    int size_k,
+    int tile_idx,
+    dim3 tileDim) {
+
+    const int threadIdx_lin = 4 * ((threadIdx.y * blockDim.x) + threadIdx.x); // linearize
+
+    const int y_a = tileDim.y*blockIdx.y + (threadIdx_lin / REDUCE_DIM);
+    const int x_a = tile_idx*REDUCE_DIM + (threadIdx_lin % REDUCE_DIM);
+
+    const int y_b = tile_idx*REDUCE_DIM + (threadIdx_lin / tileDim.x);
+    const int x_b = tileDim.x*blockIdx.x + (threadIdx_lin % tileDim.x);
+
+    void* a_shmem_addr = a_shared + threadIdx_lin;
+    void* b_shmem_addr = b_shared + threadIdx_lin;
+
+    if (y_a < size_i && x_a < size_k) {
+        const void* a_gmem_addr = a + ((y_a)*size_k + (x_a));
+        cp_async4(a_shmem_addr, a_gmem_addr);
+    } else {
+        reinterpret_cast<float4*>(a_shmem_addr)[0] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    if (y_b < size_k && x_a < size_j) {
+        const void* b_gmem_addr = b + ((y_b)*size_j + (x_b));
+        cp_async4(b_shmem_addr, b_gmem_addr);
+    } else {
+        reinterpret_cast<float4*>(b_shmem_addr)[0] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+}
+
+__device__ __forceinline__ void reduce(
+    dim3 tileDim, const float* a_shared, const float* b_shared, float sum[MICROTILE_SIZE][MICROTILE_SIZE]
+) {
+    float a_microtile[MICROTILE_SIZE][MICROTILE_REDUCE_DIM] = {0};
+    float b_microtile[MICROTILE_REDUCE_DIM][MICROTILE_SIZE] = {0};
+
+    for (int microtile_idx = 0; microtile_idx < REDUCE_DIM; microtile_idx += MICROTILE_REDUCE_DIM) {
+        // load into microtile
+        #pragma unroll
+        for (int i = 0; i < MICROTILE_SIZE; i++) {
+            #pragma unroll
+            for (int k = 0; k < MICROTILE_REDUCE_DIM; k++) {
+                a_microtile[i][k] = a_shared[(threadIdx.y + i*blockDim.y)*REDUCE_DIM + (microtile_idx + k)];
+                b_microtile[k][i] = b_shared[(microtile_idx + k)*tileDim.x + (threadIdx.x + i*blockDim.x)];
+            }
+        }
+
+        // compute microtile
+        #pragma unroll
+        for (int i = 0; i < MICROTILE_SIZE; i++) {
+            #pragma unroll
+            for (int j = 0; j < MICROTILE_SIZE; j++) {
+                #pragma unroll
+                for (int k = 0; k < MICROTILE_REDUCE_DIM; k++)  {
+                    sum[i][j] += a_microtile[i][k] * b_microtile[k][j];
+                }
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void reduce2(
+    uint2 t, dim3 tileDim, const float* a_shared, const float* b_shared, float sum[MICROTILE_SIZE][MICROTILE_SIZE]
+) {
+    float a_microtile[MICROTILE_SIZE][MICROTILE_REDUCE_DIM] = {0};
+    float b_microtile[MICROTILE_REDUCE_DIM][MICROTILE_SIZE] = {0};
+
+    for (int microtile_idx = 0; microtile_idx < REDUCE_DIM; microtile_idx += MICROTILE_REDUCE_DIM) {
+        // load into microtile
+        #pragma unroll
+        for (int i = 0; i < MICROTILE_SIZE; i++) {
+            #pragma unroll
+            for (int k = 0; k < MICROTILE_REDUCE_DIM; k++) {
+                a_microtile[i][k] = a_shared[(t.y+i)*REDUCE_DIM + (microtile_idx + k)];
+                b_microtile[k][i] = b_shared[(microtile_idx + k)*tileDim.x + (t.x+i)];
+            }
+        }
+
+        // compute microtile
+        #pragma unroll
+        for (int i = 0; i < MICROTILE_SIZE; i++) {
+            #pragma unroll
+            for (int j = 0; j < MICROTILE_SIZE; j++) {
+                #pragma unroll
+                for (int k = 0; k < MICROTILE_REDUCE_DIM; k++) {
+                    sum[i][j] += a_microtile[i][k] * b_microtile[k][j];
+                }
+            }
+        }
+    }
+}
 
 __global__ void matmul_improved(
     int32_t size_i,
@@ -181,73 +293,70 @@ __global__ void matmul_improved(
     float const *a, /* pointer to GPU memory */
     float const *b, /* pointer to GPU memory */
     float *c /* pointer to GPU memory */) {
-    
-    const dim3 tileDim{K2 * blockDim.x, K2 * blockDim.y};
-    uint32_t i = tileDim.y * blockIdx.y + threadIdx.y;
-    uint32_t j = tileDim.x * blockIdx.x + threadIdx.x;
+
+    const dim3 tileDim{MICROTILE_SIZE * blockDim.x, MICROTILE_SIZE * blockDim.y};
+
+    const uint2 t{MICROTILE_SIZE * threadIdx.x, MICROTILE_SIZE * threadIdx.y};
+    const uint32_t y = tileDim.y * blockIdx.y + t.y;
+    // const uint32_t y = tileDim.y * blockIdx.y + threadIdx.y;
+    const uint32_t x = tileDim.x * blockIdx.x + t.x;
+    // const uint32_t x = tileDim.x * blockIdx.x + threadIdx.x;
 
     extern __shared__ float shmem[];
-    float* a_shared = shmem;
-    float* b_shared = &shmem[tileDim.x * tileDim.y];
+
+    const int tile_size = tileDim.x * REDUCE_DIM;
+    float* a_shared0 = shmem;              // (tileDim.y x REDUCE_DIM)
+    float* b_shared0 = &shmem[tile_size];  // (REDUCE_DIM x tileDim.x)
+
+    float* a_shared1 = &shmem[2 * tile_size];
+    float* b_shared1 = &shmem[3 * tile_size];
     
     // if (i >= size_i || j >= size_j) return;
 
-    float a_microtile[K2][R] = {0};
-    float b_microtile[R][K2] = {0};
-    
-    float sum[K2][K2] = {0};
+    float sum[MICROTILE_SIZE][MICROTILE_SIZE] = {0};
 
-    uint32_t tile_iters = (size_k + tileDim.x - 1) / tileDim.x;
-    for (int tile_idx = 0; tile_idx < tile_iters; tile_idx++) {
-        // load into shared memory
-        #pragma unroll
-        for (int y = 0; y < K2; y++) {
-            #pragma unroll
-            for (int x = 0; x < K2; x++) {
-                uint32_t ty = threadIdx.y + y*blockDim.y;
-                uint32_t tx = threadIdx.x + x*blockDim.x;
+    uint32_t tile_iters = (size_k + REDUCE_DIM - 1) / REDUCE_DIM;
 
-                a_shared[ty*tileDim.x + tx] = a[(i+(y*blockDim.y))*size_k + (tile_idx*tileDim.x + tx)];
-                b_shared[ty*tileDim.x + tx] = b[(tile_idx*tileDim.y + ty)*size_j + (j+(x*blockDim.x))];
-            }
-        }
-        __syncthreads();
+    // load inital tiles
+    load_tiles_to_shared_fp4(a_shared0, b_shared0, a, b, size_i, size_j, size_k, 0, tileDim);
+    async_memcpy_waitall();
+    __syncthreads();
 
-        for (int k = 0; k < tileDim.x; k += R) {
-            // if (i == 0 && j == 0) {
-            //     printf("%d\n", k);
-            // }
-            // load into microtile
-            #pragma unroll
-            for (int x = 0; x < K2; x++) {
-                #pragma unroll
-                for (int r = 0; r < R; r++) {
-                    a_microtile[x][r] = a_shared[(x*blockDim.y + threadIdx.y)*tileDim.x + (k+r)];
-                    b_microtile[r][x] = b_shared[(k+r)*tileDim.x + (threadIdx.x + x*blockDim.x)];
-                }
-            }
-            // compute microtile
-            #pragma unroll
-            for (int y = 0; y < K2; y++) {
-                #pragma unroll
-                for (int x = 0; x < K2; x++) {
-                    #pragma unroll
-                    for (int r = 0; r < R; r++) {
-                        sum[y][x] += a_microtile[y][r] * b_microtile[r][x];
-                    }
-                }
-            }
-        }
+    for (int tile_idx = 1; tile_idx < tile_iters; tile_idx++) {
+        // load in next tile
+        load_tiles_to_shared_fp4(a_shared1, b_shared1, a, b, size_i, size_j, size_k, tile_idx, tileDim);
+
+        reduce2(t, tileDim, a_shared0, b_shared0, sum);
+
+        swap(a_shared0, a_shared1);
+        swap(b_shared0, b_shared1);
+
+        async_memcpy_waitall();
         __syncthreads();
     }
+
+    // last last tile
+    reduce2(t, tileDim, a_shared0, b_shared0, sum);
+
+    // // store microtile sums
+    // #pragma unroll
+    // for (int i = 0; i < MICROTILE_SIZE; i++) {
+    //     #pragma unroll
+    //     for (int j = 0; j < MICROTILE_SIZE; j++) {
+    //         c[(y + i*blockDim.y)*size_j + (x + j*blockDim.x)] = sum[i][j];
+    //     }
+    // }
+
     // store microtile sums
     #pragma unroll
-    for (int y = 0; y < K2; y++) {
+    for (int i = 0; i < MICROTILE_SIZE; i++) {
         #pragma unroll
-        for (int x = 0; x < K2; x++) {
-            c[(i + y*blockDim.y)*size_j + (j + x*blockDim.x)] = sum[y][x];
+        for (int j = 0; j < MICROTILE_SIZE; j++) {
+            c[(y + i)*size_j + (x + j)] = sum[i][j];
         }
     }
+
+
 }
 
 void launch_matmul_improved(
@@ -259,11 +368,11 @@ void launch_matmul_improved(
     float *c /* pointer to GPU memory */) {
     
     dim3 block_size(32, 32);
-    dim3 tile_size(K2 * block_size.x, K2 * block_size.y); // does block_size * k work?
+    dim3 tile_size(MICROTILE_SIZE * block_size.x, MICROTILE_SIZE * block_size.y); // does block_size * k work?
     dim3 num_blocks((size_j + tile_size.x - 1) / tile_size.x,
                     (size_i + tile_size.y - 1) / tile_size.y);
     
-    uint32_t shmem_bytes = 2 * tile_size.x * tile_size.y * sizeof(float);
+    uint32_t shmem_bytes = 2 * 2 * tile_size.x * REDUCE_DIM * sizeof(float);
 
     CUDA_CHECK(cudaFuncSetAttribute(
         matmul_improved,
