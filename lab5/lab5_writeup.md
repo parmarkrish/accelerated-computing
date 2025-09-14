@@ -1,7 +1,7 @@
 ### Question 1
 
-The best runtime I achieved was 6.46 ms. This is 8.97 TFlops. 
-Since the max theoretical TFLOPs on an a4000 is 19.1 TFLOPs. I achieve ~47% FLOPs utilization.
+The best runtime I achieved was 6.22 ms. This is 9.33 TFlops. 
+Since the max theoretical TFLOPs on an a4000 is 19.1 TFLOPs. I achieve ~49% FLOPs utilization.
 
 I used the following techniques:
 - Overlapping data movement with computation with async copy's
@@ -13,6 +13,7 @@ This performance improvement only resulted by increasing MICROTILE_REDUCE_DIM. I
 
 I believe the reason for this is because increasing MICROTILE_REDUCE_DIM resulted in better coalesed memory transactions from L1 to registers. 
 
+- For some reason adding -maxrregcount=64 improves performance.
 
 ### Question 2
 
@@ -104,7 +105,7 @@ I believe the reason for this is because increasing MICROTILE_REDUCE_DIM resulte
 
 6. 
 
-| problem size       | Expected TFLOP/s |
+| problem size       | Max theoretical TFLOP/s |
 |--------------------|-----------------:|
 | (3072, 3072, 3072) | 19.1
 | (512, 3072, 3072)  | 19.1
@@ -156,7 +157,47 @@ I believe the reason for this is because increasing MICROTILE_REDUCE_DIM resulte
 9. Having less threadblocks than SMs, reduces both memory bandwidth and computation power. 
 So, for problem sizes where we have less threadblocks than SMs the actual TFLOPs would be quite a bit lower than the expected TFLOPs in 6.
 
-10. 
+10. For problem sizes that have more threadblocks than SMs i'm obtaining ~40% FLOP utilization. However if the problem size has much less threadblocks than SMs, the performance decreases dramatically. 
+
+| problem size       | TFLOP/s |
+|--------------------|-----------------:|
+| (3072, 3072, 3072) | 7.39
+| (512, 3072, 3072)  | 8.05
+| (256, 3072, 3072)  | 9.19
+| (128, 3072, 3072)  | 4.63
+| (64, 3072, 3072)   | 2.42
+| (32, 3072, 3072)   | 1.23
+| (16, 3072, 3072)   | 0.62
+| (1, 3072, 3072)    | 0.04
+| (256, 256, 256)    | 0.74
+| (256, 256, 1024)   | 0.83
+| (256, 256, 8192)   | 0.86
+| (128, 128, 32768)  | 0.22
+
+### Question 3
+
+| problem size       | TFLOP/s | % of max theoretical
+| -------------------|---------|---------------------
+| (3072, 3072, 3072) | 6.20    |      32.46% 
+| (512, 3072, 3072)  | 5.98    |      31.31% 
+| (256, 3072, 3072)  | 5.87    |      30.73% 
+| (128, 3072, 3072)  | 5.83    |      30.52% 
+| (64, 3072, 3072)   | 3.29    |      23.84% 
+| (32, 3072, 3072)   | 1.75    |      24.93% 
+| (16, 3072, 3072)   | 0.90    |      25.42% 
+| (1, 3072, 3072)    | 0.06    |      27.27% 
+| (256, 256, 256)    | 0.24    |       1.26% 
+| (256, 256, 1024)   | 0.95    |       4.97% 
+| (256, 256, 8192)   | 5.62    |      29.42% 
+| (128, 128, 32768)  | 3.86    |      26.99% 
+
+- `matmul_improve_reduce` has slighly reduced performance for large square-ish matmuls. But when `size_i` and `size_j` are small and `size_k` is large, it has significantly increased performance
+
+- I set tuned the `K_SPLIT_SIZE` parameter by starting at 3072 and decreasing by a factor of 2 such that all problem sizes except (256, 256, 256) and (256, 256, 1024) were above 20%.
+
+- For (256, 256, 256) and (256, 256, 1024) problem sizes I achieved 1.26% and 4.97% max theoretical throughput. For those problem sizes, there simply isn't enough work to fill up all the SMs, even when performing split-k. 
+
+- 
 
 
 
