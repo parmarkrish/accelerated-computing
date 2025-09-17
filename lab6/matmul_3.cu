@@ -124,8 +124,7 @@ __device__ __forceinline__ void load_tiles_to_shared_fp4(
     const int y_a = tileDim.y*blockIdx.y + (threadIdx_lin4 / REDUCE_DIM);
     const int x_a = tile_idx*REDUCE_DIM + (threadIdx_lin4 % REDUCE_DIM);
 
-    const int yb_local = threadIdx_lin4 / tileDim.x;
-    const int y_b = tile_idx*REDUCE_DIM + (yb_local);
+    const int y_b = tile_idx*REDUCE_DIM + (threadIdx_lin4 / tileDim.x);
     const int x_b = tileDim.x*blockIdx.x + (threadIdx_lin4 % tileDim.x);
 
     void* a_shmem_addr = a_shared + threadIdx_lin4;
@@ -138,9 +137,6 @@ __device__ __forceinline__ void load_tiles_to_shared_fp4(
         reinterpret_cast<float4*>(a_shmem_addr)[0] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
 
-    // for now disable threads for tile b that load k values of 32 or greater
-    if (yb_local >= 32) return;
-
     if (y_b < size_k && x_b < size_j) {
         const void* b_gmem_addr = b + ((y_b)*size_j + (x_b));
         cp_async4(b_shmem_addr, b_gmem_addr);
@@ -149,26 +145,28 @@ __device__ __forceinline__ void load_tiles_to_shared_fp4(
     }
 }
 
-__device__ __forceinline__ void mma_16x8x8(float const *a, float const *b, int* d0, int* d1, int* d2, int* d3, dim3 tileDim, int threadIdx_lin_local) {
+__device__ __forceinline__ void mma_16x8x8_4wide(float const *a, float const *b, int* d0, int* d1, int* d2, int* d3, dim3 tileDim, int threadIdx_lin_local) {
     const int a0 = (threadIdx_lin_local % 4) + REDUCE_DIM * (threadIdx_lin_local / 4);
     const int a1 = a0 + 8 * REDUCE_DIM;
     const int a2 = a0 + 4;
     const int a3 = a1 + 4;
 
-    const int b0 = (threadIdx_lin_local % 4) * tileDim.x + (threadIdx_lin_local / 4);
-    const int b1 = b0 + 4 * tileDim.x;
+    int b0 = (threadIdx_lin_local % 4) * tileDim.x + (threadIdx_lin_local / 4);
+    int b1 = b0 + 4 * tileDim.x;
 
-    // TODO: is ASM correct
-    asm(
-        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 \
-        {%0, %1, %2, %3},     /* 'D' matrix */ \
-        {%4, %5, %6, %7},     /* 'A' matrix */ \
-        {%8, %9},             /* 'B' matrix */ \
-        {%0, %1, %2, %3}      /* 'C' matrix - Same as D  */;"
-        : "+r"(*d0), "+r"(*d1), "+r"(*d2), "+r"(*d3)
-        : "r"(__float_as_uint(a[a0])), "r"(__float_as_uint(a[a1])), "r"(__float_as_uint(a[a2])), "r"(__float_as_uint(a[a3])),
-          "r"(__float_as_uint(b[b0])), "r"(__float_as_uint(b[b1]))
-    );
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        asm(
+            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 \
+            {%0, %1, %2, %3},     /* 'D' matrix */ \
+            {%4, %5, %6, %7},     /* 'A' matrix */ \
+            {%8, %9},             /* 'B' matrix */ \
+            {%0, %1, %2, %3}      /* 'C' matrix - Same as D  */;"
+            : "+r"(d0[i]), "+r"(d1[i]), "+r"(d2[i]), "+r"(d3[i])
+            : "r"(__float_as_uint(a[a0])), "r"(__float_as_uint(a[a1])), "r"(__float_as_uint(a[a2])), "r"(__float_as_uint(a[a3])),
+            "r"(__float_as_uint(b[b0 + i*8])), "r"(__float_as_uint(b[b1 + i*8]))
+        );
+    }
 }
 
 __device__ __forceinline__ void reduce(
@@ -189,7 +187,7 @@ __device__ __forceinline__ void reduce(
     const int num_tiles = REDUCE_DIM / 8;
 
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
-        mma_16x8x8(a_start, b_start, d0, d1, d2, d3, tileDim, threadIdx_lin_local);
+        mma_16x8x8_4wide(a_start, b_start, d0, d1, d2, d3, tileDim, threadIdx_lin_local);
         a_start += 8;
         b_start += 8 * tileDim.x;
     }
@@ -204,27 +202,29 @@ __global__ void matmul_tensor(
     float const *b, /* pointer to GPU memory */
     float *c /* pointer to GPU memory */) {
 
-    const dim3 tileDim{blockDim.x, 4 * blockDim.y};
+    const dim3 tileDim{4 * blockDim.x, 4 * blockDim.y};
 
     // shared memory setup
     extern __shared__ float shmem[];
-    const int a_tile_size = tileDim.y * REDUCE_DIM;
-    const int b_tile_size = REDUCE_DIM * tileDim.x;
-    float* a_shmem0 = shmem;              // (tileDim.y x REDUCE_DIM)
-    float* b_shmem0 = &shmem[a_tile_size];  // (REDUCE_DIM x tileDim.x)
+    const int tile_size = tileDim.x * REDUCE_DIM;
+    float* a_shmem0 = shmem;
+    float* b_shmem0 = &shmem[tile_size];
 
-    float* a_shmem1 = &shmem[a_tile_size + b_tile_size];
-    float* b_shmem1 = &shmem[2 * a_tile_size + b_tile_size];
+    float* a_shmem1 = &shmem[2 * tile_size];
+    float* b_shmem1 = &shmem[3 * tile_size];
 
     // warp idxs setup
     const int threadIdx_lin = (threadIdx.y * blockDim.x) + threadIdx.x; // linearize
     const int threadIdx_lin_local = threadIdx_lin % 32;
     const int warp_idx = threadIdx_lin / 32;
     const int y_idx_start = 16 * (warp_idx / 4); 
-    const int x_idx_start = 8 * (warp_idx % 4);
+    const int x_idx_start = 32 * (warp_idx % 4);
 
     // partial sums
-    int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    int d0[4] = {0};
+    int d1[4] = {0};
+    int d2[4] = {0};
+    int d3[4] = {0};
 
     // load inital tiles
     load_tiles_to_shared_fp4(a_shmem0, b_shmem0, a, b, size_i, size_j, size_k, 0, tileDim, threadIdx_lin);
@@ -237,7 +237,7 @@ __global__ void matmul_tensor(
         load_tiles_to_shared_fp4(a_shmem1, b_shmem1, a, b, size_i, size_j, size_k, tile_idx, tileDim, threadIdx_lin);
 
         // reduce(t, tileDim, a_shared0, b_shared0, sum);
-        reduce(a_shmem0, b_shmem0, &d0, &d1, &d2, &d3, x_idx_start, y_idx_start, tileDim, threadIdx_lin_local);
+        reduce(a_shmem0, b_shmem0, d0, d1, d2, d3, x_idx_start, y_idx_start, tileDim, threadIdx_lin_local);
 
         swap(a_shmem0, a_shmem1);
         swap(b_shmem0, b_shmem1);
@@ -247,7 +247,7 @@ __global__ void matmul_tensor(
     }
 
     // last last tile
-    reduce(a_shmem0, b_shmem0, &d0, &d1, &d2, &d3, x_idx_start, y_idx_start, tileDim, threadIdx_lin_local);
+    reduce(a_shmem0, b_shmem0, d0, d1, d2, d3, x_idx_start, y_idx_start, tileDim, threadIdx_lin_local);
     
     // store sum
     float* c_start = c + (blockIdx.y * tileDim.y * size_j) + (blockIdx.x * tileDim.x);
@@ -258,10 +258,13 @@ __global__ void matmul_tensor(
     const int c2 = c0 + 8 * size_j;
     const int c3 = c1 + 8 * size_j;
 
-    c_start[c0] = __uint_as_float(d0);
-    c_start[c1] = __uint_as_float(d1);
-    c_start[c2] = __uint_as_float(d2);
-    c_start[c3] = __uint_as_float(d3);
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        c_start[c0 + i*8] = __uint_as_float(d0[i]);
+        c_start[c1 + i*8] = __uint_as_float(d1[i]);
+        c_start[c2 + i*8] = __uint_as_float(d2[i]);
+        c_start[c3 + i*8] = __uint_as_float(d3[i]);
+    }
 }
 
 size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
@@ -280,12 +283,12 @@ void launch_matmul_tensor(
 ) {
     /* TODO: your CPU code here */
     dim3 block_size(32, 32);
-    dim3 tile_size(block_size.x, 4 * block_size.y); // does block_size * k work?
+    dim3 tile_size(4 * block_size.x, 4 * block_size.y); // does block_size * k work?
     dim3 num_blocks((size_j + tile_size.x - 1) / tile_size.x,
                     (size_i + tile_size.y - 1) / tile_size.y);
     
-    // uint32_t shmem_bytes = 2 * 2 * tile_size.x * REDUCE_DIM * sizeof(float);
-    uint32_t shmem_bytes = 2 * ((tile_size.y * REDUCE_DIM) + (REDUCE_DIM * tile_size.x)) * sizeof(float);
+    uint32_t shmem_bytes = 2 * 2 * tile_size.x * REDUCE_DIM * sizeof(float);
+    // uint32_t shmem_bytes = 2 * ((tile_size.y * REDUCE_DIM) + (REDUCE_DIM * tile_size.x)) * sizeof(float);
 
     CUDA_CHECK(cudaFuncSetAttribute(
         matmul_tensor,
