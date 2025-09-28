@@ -241,8 +241,6 @@ __global__ void scan_block_circle_intersect(
 
         shmem[l_idx + i] = is_intersect;
 
-        // KERNEL_PRINTF("cx: %f, cy: %f, r: %f\n", cx, cy, r);
-        // KERNEL_PRINTF("is_intersect: %d\n", is_intersect);
     }
     __syncthreads();
 
@@ -325,8 +323,6 @@ __device__ __forceinline__ void store_on_change(
                 .c_b = circle_blue[circle_idx],
                 .pixel_alpha = circle_alpha[circle_idx]
             };
-            // dest[curr_val - 1] = i + j;  // store circle index 
-            // KERNEL_PRINTF("curr_val: %u, index: %d\n", curr_val, i+j);
         }
     }
 }
@@ -360,9 +356,6 @@ __global__ void fixup_store_circle_idxs(
     #pragma unroll
     for (int i = 0; i < NUM_ELEMENTS_PER_THREAD; i++) {
         output_idxs[i] = Op::combine(local_scan_val, workspace[j+i]);
-        // if (threadIdx.x == 0) {
-            // printf("threadIdx.x == %u, blockIdx.x == %u, output_idxs[%d] = %u\n", threadIdx.x, blockIdx.x, i, output_idxs[i]);
-        // }
     }
 
     // store_on_change
@@ -373,7 +366,6 @@ __global__ void fixup_store_circle_idxs(
     }
 
     uint32_t start_idx = (blockIdx_lin - 1 >= 0) ? draw_block_start_circle_idxs[blockIdx_lin - 1] : 0;
-    // KERNEL_PRINTF("start_idx: %u\n", start_idx);
     CircleInfo* dest_start = dest + start_idx;
 
     store_on_change(
@@ -431,13 +423,6 @@ __global__ void print_gpu_mem(
     printf("\n");
 }
 
-                // .cx = circle_x[circle_idx],
-                // .cy = circle_y[circle_idx],
-                // .c_radius = circle_radius[circle_idx],
-                // .c_r = circle_red[circle_idx],
-                // .c_g = circle_green[circle_idx],
-                // .c_b = circle_blue[circle_idx],
-                // .pixel_alpha = circle_alpha[circle_idx]
 // reorders circle data in a per block in order manner using stream compaction
 void reorder_circles_per_block(
     int32_t n_circles, 
@@ -523,11 +508,6 @@ void reorder_circles_per_block(
 
         }
     }
-    // print_gpu_mem<<<1, 1>>>(circle_infos, 0, 10);
-    // CUDA_CHECK(cudaGetLastError());
-
-    // print_gpu_mem<<<1, 1>>>(draw_block_start_circle_idxs, 0, 16);
-    // CUDA_CHECK(cudaGetLastError());
 }
 
 constexpr int REG_TILE_SIZE = 3;
@@ -626,7 +606,6 @@ __global__ void draw_block(
 
         int num_circles = min(len - i, max_circle_infos);
         for (int k = 0; k < num_circles; k++) {
-            // printf("num_circles: %d\n", num_circles);
             draw_circle(
                 outIdx,
                 x_min, x_max, y_min, y_max,
