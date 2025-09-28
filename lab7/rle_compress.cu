@@ -152,11 +152,6 @@ __device__ __forceinline__ void compute_boundaries(typename Op::Data* shmem, con
         prev_byte = curr_byte;
     }
 
-    // if (threadIdx.x == 1 && blockIdx.x == 0) {
-    //     for (int i = 0; i < NUM_ELEMENTS_PER_THREAD; i++) {
-    //         printf("i: %d | shmem: %d\n", i, shmem[start_index + i]);
-    //     }
-    // }
 }
 
 // scan main
