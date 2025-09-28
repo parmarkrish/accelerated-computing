@@ -1,3 +1,4 @@
+// Tested on RTX A4000
 // nvcc -O3 -std=c++17 -gencode arch=compute_86,code=sm_86 -o exercise_lop3 exercise_lop3.cu
 #include <cstdint>
 #include <cstdio>

@@ -1,3 +1,4 @@
+// Tested on RTX A4000
 // nvcc -O3 --use_fast_math -std=c++17 -gencode arch=compute_86,code=sm_86 -o matmul matmul_2.cu
 #include <chrono>
 #include <cstdint>
